@@ -1,0 +1,549 @@
+---
+title: "Twitter sentiment analysis with SVM"
+output: 
+  html_notebook:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+---
+
+<style type="text/css">
+
+body, td {
+   font-size: 18px;
+}
+h1 {
+  font-size: 32px;
+  font-weight: bold;
+}
+h2 {
+  font-size: 28px;
+  font-weight: bold;
+}
+h3 {
+  font-size: 24px;
+  font-weight: bold;
+}
+h4 {
+  font-size: 20px;
+  font-weight: bold;
+}
+code.r{
+  font-size: 16px;
+}
+pre {
+  font-size: 16px
+}
+</style>
+
+## 1.0 Introduction
+
+This notebook analyzes a series of tweets related to the term "java". Each tweet was classified by a human into one of several categories:
+
+- java - posts seeking Java developers
+
+- learning - learning opportunities or announcements having to do with Java programming
+
+- opinion - an opinion or a comment on Java programming
+
+- help - posts seeking help with Java programming
+
+- coffee - posts having to do with coffee (java is a common nickname for coffee)
+
+- Indonesia - posts having to do with the island of Java in Indonesia
+
+- irrelevant - posts that could be understood but could not be classified into any of the above
+
+We will train a [Support Vector Machine](https://www.youtube.com/watch?v=eHsErlPJWUU&hd=1) classifier to see how well it could predict the labels of unseen tweets.
+
+## 2. Reading the data
+
+Loading the classified tweets.
+```{r}
+tweets = read.csv("tweets_java_two_days_rated.csv", stringsAsFactors=FALSE)
+
+str(tweets)
+```
+
+We are only interested in the text and the classification of the tweets for the time being, so we discard the rest.
+```{r}
+tweets <- tweets[,c("text", "class")]
+str(tweets)
+```
+
+Let's remove the unclassified tweets
+```{r}
+tweets <- tweets[tweets$class != "",]
+str(tweets)
+```
+
+## 3.0 Pre-processing the data
+
+We want to streamline the dataset by discarding redundancies and certain words that don't aid in classifying a tweet. We first load two libraries we will be using for that purpose: the text mining library [**tm**](https://cran.r-project.org/web/packages/tm/tm.pdf) and the word stemmer [**SnowballC**](https://cran.r-project.org/web/packages/SnowballC/SnowballC.pdf).
+```{r, message=FALSE, warning=FALSE}
+library(tm)
+library(SnowballC)
+```
+
+### 3.1 Creating a corpus of tweets
+
+Create the word corpus, which is basically a list of the documents (tweets). Actually, it's a list of lists: each corpus' sub-list has a "content" component, which is the actual tweet, and a "meta" component, some metadata.
+```{r}
+# Create corpus
+corpus = Corpus(VectorSource(tweets$text))
+
+# Look at the first tweet's text
+corpus[[1]]$content
+```
+
+### 3.2 Converting tweets to lowercase
+
+We want to convert all the text of each tweet to lowercase so the classifier won't have to distinguish between "Java" and "java", for example.
+```{r}
+# Convert to lower-case
+# tm_map() applies the function tolower() to the corpus
+corpus = tm_map(corpus, tolower)
+
+# https://discuss.analyticsvidhya.com/t/error-inherits-doc-textdocument-is-not-true-in-r/1078/4
+corpus <- tm_map(corpus, PlainTextDocument)
+
+# Look at the first tweet's text
+corpus[[1]]$content
+```
+
+### 3.3 Removing punctuation and stopwords
+
+Punctuation is not helpful to classify text, so we can discard it.
+```{r}
+# Remove punctuation
+# tm_map() applies the function removePunctuation() to the corpus
+corpus = tm_map(corpus, removePunctuation)
+# Look at the first tweet's text
+corpus[[1]]$content
+```
+
+Likewise, English stopwords such as articles ("the", "a", "an"), pronouns ("we", "she", "it", ...), the verb "to be" and its conjugations ("is", "was", "were", ...), etc. do not aid in classification. We will also remove the term "java" from each tweet, since it's common to all tweets and therefore won't help us either.
+```{r}
+# Remove English stopwords
+# tm_map() applies the function removeWords() and its arguments to the corpus
+corpus = tm_map(corpus, removeWords, c("java", stopwords("english")))
+
+# Look at the first tweet's text
+corpus[[1]]$content
+```
+
+### 3.4 Stemming the tweets
+
+This streamlines the tweets further by removing words' [inflections](http://esl.fis.edu/grammar/rules/inflections.htm). E.g., "I tried to...", "I have been trying to...", "I will try to..." all have conjugations of the verb "to try", but we hardly need to include all three of them as separate features. Another example would be word plurals, such as "job" and "jobs".
+```{r}
+# Stem document 
+# tm_map() applies the function stemDocument() to the corpus
+corpus = tm_map(corpus, stemDocument)
+
+# Look at the first tweet's text
+corpus[[1]]$content
+```
+
+### 3.5 Creating the Document-Term Matrix
+
+This will create a matrix where each row is a document (tweet) and each column is a term, i.e., a word. Each entry is a frequency of a given word in a given tweet
+```{r}
+# Create matrix
+frequencies = DocumentTermMatrix(corpus)
+
+frequencies
+```
+
+### 3.6 Dealing with DTM sparsity
+
+The `frequencies` DTM is *very* sparse, which means almost all its entries are 0. We have a matrix with hundreds of thousands of items and only a few thousand of them are non-zero. We can reduce the size of the matrix by requiring that a word (term) appears in at least a certain percentage of the tweets for it to be included. If it doesn't, we can discard that column
+```{r}
+# Remove sparse terms
+# The sparse argument in removeSparseTerms():
+# If we set it to 0.99, that means we want to keep terms (columns) that appear
+# in 1% or more of the documents (tweets in this case). If we set it to 0.995,
+# we want to keep terms that appear in 0.5% or more of the tweets.
+sparse = removeSparseTerms(frequencies, 0.99)
+sparse
+```
+
+We have reduced the size of the DTM by over an order of magnitude, from 3600 terms to 99.
+
+### 3.7 Converting DTM to dataframe and final tidying up
+
+Convert `sparse` from DTM to a dataframe
+```{r}
+# Convert to a data frame
+tweetsSparse = as.data.frame(as.matrix(sparse))
+class(tweetsSparse)
+```
+
+`make.names()` makes all variable names R-friendly. This is done specially for numbers, which can't be used as variables. So for example, `make.names("5")` returns "X5".
+```{r}
+# Make all terms R-friendly
+colnames(tweetsSparse) = make.names(colnames(tweetsSparse))
+```
+
+Convert the classification column $class$ from character to factor.
+```{r}
+# Converting from character to factor
+tweetsSparse$class = as.factor(tweets$class)
+```
+
+## 4.0 Data visualization: word clouds
+
+Before building the SVM classifier, we can visualize the term (word stem) frequencies of the tweets' classes.
+
+```{r, eval=FALSE, fig.height=14, fig.width=8, include=FALSE}
+layout(matrix(c(rep(1,3), rep(2,3), rep(3,3), rep(4,3), rep(5,3), rep(6,3), rep(7,3), rep(8,3),  rep(9,2), rep(10,2), rep(11,2), rep(12,2), rep(13,2), rep(14,2) ), ncol = 6, byrow=TRUE), heights = c(1,6,1,6,1,6))
+
+par(mar=rep(0, 4))
+
+plot.new()
+text(x=0.5, y=0.5, "Jobs word cloud", cex = 1.5, font = 2)
+plot.new()
+text(x=0.5, y=0.5, "Learning word cloud", cex = 1.5, font = 2)
+
+wordcloud(words = d$word, freq = d$freq, min.freq = 2, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(9, 0.9))
+
+wordcloud(words = freq_df_learning$word, freq = freq_df_learning$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(4.5, 0.45))
+
+plot.new()
+text(x=0.5, y=0.5, "Opinion word cloud", cex = 1.3, font = 2)
+plot.new()
+text(x=0.5, y=0.5, "Indonesia word cloud", cex = 1.3, font = 2)
+
+wordcloud(words = freq_df_opinion$word, freq = freq_df_opinion$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(5, 0.5))
+
+wordcloud(words = freq_df_Indonesia$word, freq = freq_df_Indonesia$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(8, 0.8))
+
+plot.new()
+text(x=0.5, y=0.5, "Title of my fifth plot")
+plot.new()
+text(x=0.5, y=0.5, "Title of my sixth plot")
+plot.new()
+text(x=0.5, y=0.5, "Title of my seventh plot")
+
+wordcloud(words = d$word, freq = d$freq, min.freq = 2, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(5, 0.5))
+
+wordcloud(words = d$word, freq = d$freq, min.freq = 2, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+wordcloud(words = d$word, freq = d$freq, min.freq = 2, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+```
+
+```{r, fig.width = 8, fig.height = 12}
+# http://www.sthda.com/english/wiki/text-mining-and-word-cloud-fundamentals-in-r-5-simple-steps-you-should-know
+layout(matrix(c(rep(1,3), rep(2,3), rep(3,3), rep(4,3), rep(5,2), rep(6,2), rep(7,2)), ncol = 6, byrow=TRUE))
+#layout.show(4)
+par(mar=rep(0, 4))
+set.seed(5678)
+
+library(wordcloud)
+
+# Job tweets' word cloud
+tweetsSparseJobs <- tweetsSparse[tweetsSparse$class == "job",]
+tweetsSparseJobsMatrix <- as.matrix(tweetsSparseJobs[, !names(tweetsSparseJobs) %in% c("class")])
+freq_table_jobs <- sort(colSums(tweetsSparseJobsMatrix),decreasing=TRUE)
+freq_df_jobs <- data.frame(word = names(freq_table_jobs), freq=freq_table_jobs)
+
+wordcloud(words = freq_df_jobs$word, freq = freq_df_jobs$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(7, 0.7))
+text(x=0.5, y=1, "Jobs word cloud", cex = 1.5, font = 2)
+
+# Learning tweets' word cloud
+tweetsSparseLearning <- tweetsSparse[tweetsSparse$class == "learning",]
+tweetsSparseLearningMatrix <- as.matrix(tweetsSparseLearning[, !names(tweetsSparseLearning) %in% c("class")])
+freq_table_learning <- sort(colSums(tweetsSparseLearningMatrix),decreasing=TRUE)
+freq_df_learning <- data.frame(word = names(freq_table_learning), freq=freq_table_learning)
+
+wordcloud(words = freq_df_learning$word, freq = freq_df_learning$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(5, 0.5))
+text(x=0.5, y=1, "Learning word cloud", cex = 1.5, font = 2)
+
+# Opinion tweets' word cloud
+tweetsSparseOpinion <- tweetsSparse[tweetsSparse$class == "opinion",]
+tweetsSparseOpinionMatrix <- as.matrix(tweetsSparseOpinion[, !names(tweetsSparseOpinion) %in% c("class")])
+freq_table_opinion <- sort(colSums(tweetsSparseOpinionMatrix),decreasing=TRUE)
+freq_df_opinion <- data.frame(word = names(freq_table_opinion), freq=freq_table_opinion)
+
+wordcloud(words = freq_df_opinion$word, freq = freq_df_opinion$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(4.0, 0.4))
+text(x=0.5, y=1, "Opinion word cloud", cex = 1.5, font = 2)
+
+# Indonesia tweets' word cloud
+tweetsSparseIndonesia <- tweetsSparse[tweetsSparse$class == "Indonesia",]
+tweetsSparseIndonesiaMatrix <- as.matrix(tweetsSparseIndonesia[, !names(tweetsSparseIndonesia) %in% c("class")])
+freq_table_Indonesia <- sort(colSums(tweetsSparseIndonesiaMatrix),decreasing=TRUE)
+freq_df_Indonesia <- data.frame(word = names(freq_table_Indonesia), freq=freq_table_Indonesia)
+
+wordcloud(words = freq_df_Indonesia$word, freq = freq_df_Indonesia$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(8, 0.8))
+text(x=0.5, y=1, "Indonesia word cloud", cex = 1.5, font = 2)
+
+# Coffee tweets' word cloud
+tweetsSparseCoffee <- tweetsSparse[tweetsSparse$class == "coffee",]
+tweetsSparseCoffeeMatrix <- as.matrix(tweetsSparseCoffee[, !names(tweetsSparseCoffee) %in% c("class")])
+freq_table_coffee <- sort(colSums(tweetsSparseCoffeeMatrix),decreasing=TRUE)
+freq_df_coffee <- data.frame(word = names(freq_table_coffee), freq=freq_table_coffee)
+
+wordcloud(words = freq_df_coffee$word, freq = freq_df_coffee$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(6, 0.6))
+text(x=0.5, y=1, "Coffee word cloud", cex = 1.5, font = 2)
+
+# Help tweets' word cloud
+tweetsSparseHelp <- tweetsSparse[tweetsSparse$class == "help",]
+tweetsSparseHelpMatrix <- as.matrix(tweetsSparseHelp[, !names(tweetsSparseHelp) %in% c("class")])
+freq_table_help <- sort(colSums(tweetsSparseHelpMatrix),decreasing=TRUE)
+freq_df_help <- data.frame(word = names(freq_table_help), freq=freq_table_help)
+
+wordcloud(words = freq_df_help$word, freq = freq_df_help$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(5, 0.5))
+text(x=0.5, y=1, "Help word cloud", cex = 1.5, font = 2)
+
+# Irrelevant tweets' word cloud
+tweetsSparseIrrel <- tweetsSparse[tweetsSparse$class == "irrelevant",]
+tweetsSparseIrrelMatrix <- as.matrix(tweetsSparseIrrel[, !names(tweetsSparseIrrel) %in% c("class")])
+freq_table_irrel <- sort(colSums(tweetsSparseIrrelMatrix),decreasing=TRUE)
+freq_df_irrel <- data.frame(word = names(freq_table_irrel), freq=freq_table_irrel)
+
+wordcloud(words = freq_df_irrel$word, freq = freq_df_irrel$freq, min.freq = 1, 
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(5, 0.5))
+text(x=0.5, y=1, "Irrelevant word cloud", cex = 1.5, font = 2)
+```
+
+There are several terms that appear frequently in more than one category. For example, "develop" appears often in tweets related to both jobs and learning opportunities. Likewise, "python" and "javascript" commonly show up in both opinion and learning tweets.
+
+## 5.0 Building the SVM classifier
+
+Now we are ready to build the classifier.
+
+### 5.1 Splitting into training and testing sets
+
+We will split the data 70/30 into training and testing sets
+```{r, message=FALSE, warning=FALSE}
+# Split the data
+
+library(caTools)
+
+set.seed(5678)
+
+split = sample.split(tweetsSparse$class, SplitRatio = 0.7)
+
+trainSparse = subset(tweetsSparse, split==TRUE)
+testSparse = subset(tweetsSparse, split==FALSE)
+cat("Dimensions of training dataset: ", dim(trainSparse), "\nDimensions of test dataset: ", dim(testSparse))
+```
+
+### 5.2 An SVM classifier with an RBF kernel
+
+We will train the [**e1071**](https://cran.r-project.org/web/packages/tm/tm.pdf) library's implementation of [SVM](https://cran.r-project.org/web/packages/e1071/vignettes/svmdoc.pdf) using a Radial Basis Function [kernel](https://blog.statsbot.co/support-vector-machines-tutorial-c1618e635e93). Please see Section 9.3.2 of [ISLR](http://www-bcf.usc.edu/~gareth/ISL/ISLR%20First%20Printing.pdf) for an overview of the RBF kernel. We will follow the [advice](https://www.csie.ntu.edu.tw/~cjlin/papers/guide/guide.pdf) of the folks behind the LIBSVM algorithm that is implemented by the **e1071** library and try the RBF kernel first.
+
+#### 5.2.1 An SVM with RBF kernel example
+
+Most of the examples of support vector classification, whether using linear, polynomial, or RBF kernels, involve two classes. I wanted to visualize how it worked in a case where the data had more than two classes, since in our case we have seven. I created an artificial four-class data sample where the data is definitely not linearly separable, and tried to train the SVM with RBF kernel on it. Here is the made-up example data:
+
+```{r, fig.width = 5, fig.asp = 1}
+set.seed(5678)
+x41 <- runif(200, min = -3, max = 3)
+x42 <- runif(200, min = -3, max = 3)
+y41 <- ifelse(sqrt(x41^2 + x42^2) < 1.0, 1, ifelse(sqrt(x41^2 + x42^2) > 1.0 & sqrt(x41^2 + x42^2) < 2.0, 2, ifelse(sqrt(x41^2 + x42^2) > 2.0 & sqrt(x41^2 + x42^2) < 3.0, 3, 4)))
+plot(x41, x42, col = ifelse(sqrt(x41^2 + x42^2) < 1.0, "red", ifelse(sqrt(x41^2 + x42^2) > 1.0 & sqrt(x41^2 + x42^2) < 2.0, "green", ifelse(sqrt(x41^2 + x42^2) > 2.0 & sqrt(x41^2 + x42^2) < 3.0, "blue", "gray"))), pch = 19)
+
+# Plotting circles
+# https://stackoverflow.com/questions/22265704/drawing-circle-in-r
+radius <- c(1:3)
+theta <- seq(0, 2 * pi, length = 200)
+
+# draw the circles
+lines(x = radius[1] * cos(theta), y = radius[1] * sin(theta))
+lines(x = radius[2] * cos(theta), y = radius[2] * sin(theta))
+lines(x = radius[3] * cos(theta), y = radius[3] * sin(theta))
+```
+
+The data has been arbitrarily classified inside or outside either rings or circles. We only have 2 predictors so we can visualize it. Here is the SVM-RBF implementation. We will follow the [advice](https://www.csie.ntu.edu.tw/~cjlin/papers/guide/guide.pdf) of the folks behind the LIBSVM algorithm that is implemented by the **e1071** library and use cross-validation to find the best parameters. We can tune the model using `tune.svm()`, which finds optimal values of $\gamma$ and $C$ using 10-fold cross-validation. Here we are using values of $\gamma$ from $10^{-3}$ to $10^{-1}$, with $C$ values of $1$, $10$, and $100$.
+```{r, fig.width = 6, fig.asp = 0.8}
+y41 <- as.factor(y41)
+my_df4 <- data.frame(x42, x41, y41)
+set.seed(5678)
+library(e1071)
+my_model4_tuned <- tune.svm(y41~., data = my_df4, kernel = "radial", gamma = 10^(-3:-1), cost = 10^(0:2))
+gamma_best <- my_model4_tuned$best.parameters$gamma
+cost_best <- my_model4_tuned$best.parameters$cost
+my_model4 <- svm(y41 ~ ., data = my_df4, kernel = "radial", gamma = gamma_best, cost = cost_best)
+plot(my_model4, my_df4, xlim = c(-3,3), ylim = c(-3,3))
+```
+
+#### 5.2.2 Training the SVM with RBF kernel on the twitter data
+
+We can follow the same procedure to train the SVM on the twitter data. Here we will not be able to visualize the data since the there are many predictors.
+```{r, warning=FALSE}
+set.seed(5678)
+tuned <- tune.svm(class~., data = trainSparse, gamma = 10^(-6:-1), cost = 10^(0:2))
+gamma_best <- tuned$best.parameters$gamma
+cost_best <- tuned$best.parameters$cost
+model.tuned <- svm(class~., data = trainSparse, gamma = gamma_best, cost = cost_best)
+```
+
+Let's see how the tuned SVM model performs on the test data.
+```{r}
+svm.tuned.pred <- predict(model.tuned, newdata=testSparse, type="class")
+svm.tuned.table <- table(testSparse$class, svm.tuned.pred)
+svm.tuned.table
+```
+
+Performance of the tuned model on the test set
+```{r}
+accuracy_tuned_svm <- sum(diag(svm.tuned.table)) / sum(svm.tuned.table)
+cat("Accuracy of tuned SVM:", accuracy_tuned_svm)
+```
+
+The accuracy of the SVM model is good. It does well for the two most frequent tweet categories, jobs and learning, but it tends to misclassify the opinion tweets as learning ones. It correctly classified only about a third of the opinion tweets. Since the opinion tweets are the third most frequently seen class after jobs and learning, the model's accuracy degraded significantly. The model also was only able to correctly classify only one out of five help tweets, and three out of nine Indonesia tweets.
+
+### 5.3 An SVM classifier with a linear kernel
+
+It has been [argued](https://calculatedcontent.com/2012/02/06/kernels_part_1/) that linear kernels might be better suited to text classification than RBF kernels. Linear kernels are less computationally expensive, so they are worth a try.
+
+#### 5.3.1 An SVM with linear kernel example
+
+Here again I wanted to see what an SVM trained on multi-class data would look like, this time using a linear kernel. Again artificially generated data, now linearly separable, was generated.
+```{r, fig.width = 6, fig.asp = 1.0}
+set.seed(5678)
+x11 <- rnorm(100)
+x22 <- rnorm(100)
+y1 <- ifelse(x22 <= x11 & x22 >= -x11, 1, ifelse(x22 >= x11 & x22 >= -x11, 2, ifelse(x22 <= -x11 & x22 >= x11, 3, 4)))
+plot(x11, x22, col = ifelse(x22 <= x11 & x22 >= -x11, "red", ifelse(x22 >= x11 & x22 >= -x11, "green", ifelse(x22 <= -x11 & x22 >= x11, "blue", "gray"))), pch = 19, xlim = c(-2,2), ylim = c(-2,2))
+lines(x11, -x11)
+lines(x11, x11)
+```
+
+Now let's train the SVM with linear kernel
+```{r, fig.width = 6, fig.asp = 0.8}
+y1 <- as.factor(y1)
+my_df2 <- data.frame(x22, x11, y1)
+my_model2 <- svm(y1 ~ ., data = my_df2, kernel = "linear")
+plot(my_model2, my_df2)
+```
+
+Great! The plotting of the SVM model is a little jagged, but still.
+
+#### 5.3.2 Training the SVM with linear kernel on the twitter data
+
+Now let's see how the linear kernel does on the twitter data. Again, we won't be able to see any nifty plot here.
+```{r}
+set.seed(5678)
+tuned.linear <- tune.svm(class~., kernel = "linear", data = trainSparse, cost = 10^(-2:2))
+best_cost_linear <- tuned.linear$best.parameters$cost
+model.linear.tuned <- svm(class~., data = trainSparse, kernel = "linear", cost = best_cost_linear)
+```
+
+Let's see how the tuned SVM model performs on the test data.
+```{r}
+svm.tuned.linear.pred <- predict(model.linear.tuned, newdata=testSparse, type="class")
+svm.tuned.linear.table <- table(testSparse$class, svm.tuned.linear.pred)
+svm.tuned.linear.table
+```
+
+Performance of the tuned linear SVM model on the test set
+```{r}
+accuracy_tuned_linear_svm <- sum(diag(svm.tuned.linear.table)) / sum(svm.tuned.linear.table)
+cat("Accuracy of tuned linear SVM:", accuracy_tuned_linear_svm)
+```
+
+So the performance of the linear kernel is comparable to that of the RBF kernel, if not a little better. Since it is also less computationally onerous, it might be the preferred way to go.
+
+## 6.0 Summary
+
+We have tried an RBF-SVM and a linear-SVM classifier on a dataset of tweets that have been categorized into seven classes. The accuracy of both classifiers is just shy of $70\%$. Since linear-SVM is more computationally inexpensive, we would prefer it. If we had been a little less ambitious and lumped the "job", "learning", "help", and "opinion" tweets into a single class called "programming", either SVM would have achieved an accuracy in the high eighties or low nineties. For example, the linear SVM would have had $25$ misclassified tweets in the test set, out of $253$ tweets.
+
+## 7.0 References
+
+1. Bertsimas, D., O'Hair, A. [***The Analytics Edge***](https://www.edx.org/course/analytics-edge-mitx-15-071x-3). Spring 2014. edX.org.
+
+2. Chiu Yu-Wei. ***Machine Learning with R Cookbook***. Birmingham: Packt Publishing, 2015, PDF.
+
+3. Hsu Chih-Wei, Chih-Chung Chang, and Chih-Jen Lin. [***A Practical Guide to Support Vector Classification***](https://www.csie.ntu.edu.tw/~cjlin/papers/guide/guide.pdf)
+
+4. adityashrm21 and anon. [***Error: inherits(doc, “TextDocument”) is not TRUE in R***](https://discuss.analyticsvidhya.com/t/error-inherits-doc-textdocument-is-not-true-in-r/1078).
+
+5. STHDA. [***Text mining and word cloud fundamentals in R : 5 simple steps you should know***](http://www.sthda.com/english/wiki/text-mining-and-word-cloud-fundamentals-in-r-5-simple-steps-you-should-know).
+
+6. knb and Andrie. [***R: add title to wordcloud graphics / png***](https://stackoverflow.com/questions/15224913/r-add-title-to-wordcloud-graphics-png).
+
+7. Sandra Schlichting and bnaul. [***Plot two graphs in same plot in R***](https://stackoverflow.com/questions/2564258/plot-two-graphs-in-same-plot-in-r)
+
+8. Mona Jalal and Gregor. [***drawing circle in R***](https://stackoverflow.com/questions/22265704/drawing-circle-in-r)
+
+9. Ghose, Abhishek. [***Support Vector Machine (SVM) Tutorial***](https://blog.statsbot.co/support-vector-machines-tutorial-c1618e635e93)
+
+10. Jcrow06 and tim riffe. [***R color scatter plot points based on values***](https://stackoverflow.com/questions/17551193/r-color-scatter-plot-points-based-on-values)
+
+11. Charles Martin. [***KERNELS PART 1: WHAT IS AN RBF KERNEL? REALLY?***](https://calculatedcontent.com/2012/02/06/kernels_part_1/)
+
+
+```{r, eval=FALSE, fig.asp=1.0, fig.width=6, include=FALSE}
+## Keeping this one b/c I don't want to lose the work on polynomial
+set.seed(5678)
+x31 <- runif(200, min = -1, max = 1)
+x32 <- runif(200, min = -1, max = 1)
+y31 <- ifelse(x32 >= x31^2, 1, ifelse(x32 <= x31^2 & x32 >= x31^2 - 1, 2, 3))
+plot(x31, x32, col = ifelse(x32 >= x31^2, "red", ifelse(x32 <= x31^2 & x32 >= x31^2 - 1, "green", "blue")), pch = 19)
+curve(x^2, add = TRUE)
+curve(x^2 - 1, add = TRUE)
+```
+
+```{r, eval=FALSE, fig.asp=0.8, fig.width=6, include=FALSE}
+## Keeping this one b/c I don't want to lose the work on polynomial
+y31 <- as.factor(y31)
+my_df3 <- data.frame(x32, x31, y31)
+my_model3 <- svm(y31 ~ ., data = my_df3, kernel = "polynomial", coef0 = 2)
+plot(my_model3, my_df3)
+```
+
+```{r, eval=FALSE, include=FALSE}
+## Keeping this one b/c I don't want to lose the work on polynomial
+set.seed(5678)
+tuned.poly <- tune.svm(class~., kernel = "polynomial", data = trainSparse, gamma = 10^(-2:-1), degree = (1:3), coef0 = 1, cost = 10^(0:2))
+summary(tuned.poly)
+```
+
+
+```{r, eval=FALSE, include=FALSE}
+## Keeping this one b/c I don't want to lose the work on polynomial
+model.poly.tuned <- svm(class~., data = trainSparse, kernel = "polynomial", degree = 2, gamma = 0.01, coef0 = 1, cost = 1)
+summary(model.poly.tuned)
+```
+
+
+```{r, eval=FALSE, include=FALSE}
+## Keeping this one b/c I don't want to lose the work on polynomial
+svm.tuned.poly.pred <- predict(model.poly.tuned, newdata=testSparse, type="class")
+svm.tuned.poly.table <- table(testSparse$class, svm.tuned.poly.pred)
+svm.tuned.poly.table
+```
+
+```{r, eval=FALSE, include=FALSE}
+## Keeping this one b/c I don't want to lose the work on polynomial
+accuracy_tuned_poly_svm <- sum(diag(svm.tuned.poly.table)) / sum(svm.tuned.poly.table)
+cat("Accuracy of tuned polynomial SVM:", accuracy_tuned_poly_svm)
+```
