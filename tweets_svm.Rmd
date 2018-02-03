@@ -1,5 +1,5 @@
 ---
-title: "Twitter sentiment analysis with SVM"
+title: "Classifying tweets using SVM"
 output: 
   html_notebook:
     toc: true
